@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m unittest test_lexer.py -v)",
+      "Bash(python *)",
+      "Bash(rm -rf ruby_lexer)",
+      "Read(//c/c/Users/nguye/uniyear/**)"
+    ]
+  }
+}

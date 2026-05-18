@@ -1,12 +1,14 @@
 # Ruby Lexer
 
-A lexer for Ruby source code, written in Python. Given a Ruby program as input, it scans the text and produces a flat sequence of typed tokens — the first stage of any compiler or interpreter pipeline.
+A lexer for Ruby source code, written in C as a finite state machine. Given a Ruby program as input, it scans the text and produces a flat sequence of typed tokens — the first stage of any compiler or interpreter pipeline.
+
+The lexer is hand-written: no regex, no third-party library. It recognizes the language with an explicit state machine driven by a `switch`, scanning the source one character at a time.
 
 ---
 
 ## What is a Lexer?
 
-A **lexer** (also called a *scanner* or *tokenizer*) reads raw source text and breaks it into meaningful units called **tokens**. Each token carries three things: its *type* (what kind of thing it is), its *value* (the exact text from the source), and its *line number* (where it appeared).
+A **lexer** (also called a *scanner* or *tokenizer*) reads raw source text and breaks it into meaningful units called **tokens**. Each token carries four things: its *type* (what kind of thing it is), its *value* (the exact text from the source), its *line*, and its *column* (where it appeared).
 
 For example, the Ruby line:
 
@@ -17,12 +19,12 @@ def greet(name)
 produces these tokens:
 
 ```
-LINE  TYPE          VALUE
-1     KEYWORD       def
-1     IDENTIFIER    greet
-1     UNKNOWN       (
-1     IDENTIFIER    name
-1     UNKNOWN       )
+LINE  COL   TYPE          VALUE
+1     1     KEYWORD       def
+1     5     IDENTIFIER    greet
+1     10    UNKNOWN       (
+1     11    IDENTIFIER    name
+1     15    UNKNOWN       )
 ```
 
 The lexer does **not** check grammar or meaning — it only classifies. That is the job of a parser, which is out of scope here.
@@ -51,12 +53,12 @@ case  when  module  next  break  retry  redo  alias  defined?
 Local variable names and method names. They start with a lowercase letter or underscore.
 
 ```ruby
-my_var      # local variable
-_private    # underscore prefix — conventional for "private" or unused
-count       # simple name
+my_var
+_private
+count
 
-empty?      # method name ending in ? — predicate (returns true/false)
-save!       # method name ending in ! — mutating or dangerous version
+empty?
+save!
 ```
 
 The `?` and `!` suffixes are part of the identifier, not separate tokens.
@@ -66,20 +68,18 @@ The `?` and `!` suffixes are part of the identifier, not separate tokens.
 Start with an uppercase letter. Used for class names, module names, and fixed values.
 
 ```ruby
-MyClass     # class name
-MAX_SIZE    # configuration constant (all-caps by convention)
-PI          # mathematical constant
+MyClass
+MAX_SIZE
+PI
 ```
-
-Ruby enforces that reassigning a constant produces a warning — the uppercase letter is a signal to the programmer.
 
 ### Instance Variables
 
-Prefixed with `@`. Belong to a specific object instance. Accessible anywhere within the object's methods.
+Prefixed with `@`. Belong to a specific object instance.
 
 ```ruby
-@name       # instance variable
-@user_id    # instance variable with underscore
+@name
+@user_id
 ```
 
 ### Class Variables
@@ -87,102 +87,85 @@ Prefixed with `@`. Belong to a specific object instance. Accessible anywhere wit
 Prefixed with `@@`. Shared across all instances of a class and its subclasses.
 
 ```ruby
-@@count       # class variable
-@@instances   # class variable
+@@count
+@@instances
 ```
 
-Class variables must be matched before instance variables in the lexer — otherwise `@@count` would be tokenized as `@` (unknown) followed by `@count` (instance variable), which is wrong.
+`@@` must be recognized before `@` — otherwise `@@count` would be tokenized as `@` followed by an instance variable `@count`, which is wrong.
 
 ### Global Variables
 
 Prefixed with `$`. Accessible from anywhere in the program.
 
 ```ruby
-$global     # user-defined global
-$DEBUG      # Ruby built-in global flag
+$global
+$DEBUG
 ```
 
 ---
 
 ## How It Works
 
-The lexer lives in `ruby_lexer/lexer.py` and is built around three ideas.
+The lexer is a **finite state machine**. Instead of matching patterns with a regex engine, it keeps a current *state*, reads one character at a time, and decides what to do based on that state and that character.
 
-### 1. A Single Master Regex
+### The States
 
-All token patterns are combined into one regular expression using named groups and the alternation operator `|`. Python's `re.finditer` scans the source left-to-right, and at each position tries each alternative in order — the first one that matches wins.
-
-```python
-_MASTER_PATTERN = re.compile(
-    r'(?P<NEWLINE>\n)'
-    r'|(?P<WHITESPACE>[ \t\r]+)'
-    r'|(?P<CLASS_VAR>@@[a-zA-Z_][a-zA-Z0-9_]*)'
-    r'|(?P<INSTANCE_VAR>@[a-zA-Z_][a-zA-Z0-9_]*)'
-    r'|(?P<GLOBAL_VAR>\$[a-zA-Z_][a-zA-Z0-9_]*)'
-    r'|(?P<WORD>[a-zA-Z_][a-zA-Z0-9_]*[?!]?)'
-    r'|(?P<COMMENT>#[^\n]*)'
-    r'|(?P<UNKNOWN>.)'
-)
+```c
+typedef enum {
+    ST_START,
+    ST_IN_WORD,
+    ST_IN_IVAR,
+    ST_IN_CVAR,
+    ST_IN_GVAR,
+    ST_IN_COMMENT
+} LexerState;
 ```
 
-The order of alternatives is not cosmetic — it is correctness-critical:
+The scanner starts in `ST_START`. Looking at the next character, it transitions into one of the other states, which then consume characters until the token is complete — at which point it returns to `ST_START`.
 
-- **`CLASS_VAR` before `INSTANCE_VAR`**: both patterns start with `@`. If `INSTANCE_VAR` came first, `@@count` would match `@` as an unknown character, then `@count` as an instance variable. With `CLASS_VAR` first, `@@count` is consumed in one match.
-- **`WORD` ends with `[?!]?`**: the optional suffix captures `defined?`, `empty?`, and `save!` as single tokens. Without it, `defined?` would become the identifier `defined` plus the unknown character `?`, and `defined?` would never be recognized as a keyword.
-- **`UNKNOWN` is `.` without `re.DOTALL`**: the dot does not match newlines by default. Newlines are handled exclusively by the `NEWLINE` group so they can be counted for line tracking.
+### The Scan Loop
 
-### 2. Line Tracking
+`tokenize()` walks the source with a `switch (state)` inside a loop:
 
-A `line` counter starts at 1. The `NEWLINE` group matches every `\n` but does not emit a token — it just increments the counter. Every token that *is* emitted receives the current value of `line`.
+- **`ST_START`** — inspect the current character and decide:
+  - newline → advance line counter, reset column to 1
+  - space / tab / `\r` → skip
+  - `#` → enter `ST_IN_COMMENT`
+  - `@` → look ahead one character; a second `@` means `ST_IN_CVAR`, otherwise `ST_IN_IVAR`
+  - `$` → enter `ST_IN_GVAR`
+  - letter or `_` → enter `ST_IN_WORD`
+  - anything else → emit a one-character `UNKNOWN` token
 
-```python
-if kind == 'NEWLINE':
-    line += 1
-    continue   # not emitted
+- **`ST_IN_WORD`** — accumulate letters, digits, and underscores, then allow one optional `?` or `!`. When the word ends it is classified: a keyword becomes `KEYWORD`, an uppercase first letter makes it a `CONSTANT`, otherwise it is an `IDENTIFIER`.
+
+- **`ST_IN_IVAR` / `ST_IN_CVAR` / `ST_IN_GVAR`** — accumulate identifier characters after the sigil, then emit the matching token type.
+
+- **`ST_IN_COMMENT`** — consume everything up to (but not including) the newline, emitting no token at all. The newline itself is handled by `ST_START`, so the line counter still advances correctly.
+
+### Line and Column Tracking
+
+The scanner keeps a 1-based `line` and `col` as it advances. Every time it passes a `\n`, `line` increments and `col` resets to 1; otherwise `col` increments. When a token begins, its starting line and column are recorded and stored on the token.
+
+### Tokens
+
+Each token is a simple record:
+
+```c
+typedef struct {
+    TokenType type;
+    char      value[MAX_TOKEN_LEN];
+    int       line;
+    int       col;
+} Token;
 ```
 
-Whitespace and Ruby line comments are also skipped instead of being emitted as tokens:
-
-```python
-elif kind in ('WHITESPACE', 'COMMENT'):
-    continue
-```
-
-### 3. Post-Processing WORD Matches
-
-Keywords and identifiers share the same character set, so they are captured by one pattern (`WORD`) and distinguished afterwards:
-
-```python
-elif kind == 'WORD':
-    if value in KEYWORDS:
-        tt = TokenType.KEYWORD
-    elif value[0].isupper():
-        tt = TokenType.CONSTANT
-    else:
-        tt = TokenType.IDENTIFIER
-```
-
-`KEYWORDS` is a `frozenset` for O(1) membership lookup. If the value is not a keyword, an uppercase first character means it is a constant; otherwise it is an identifier.
-
-### Token Dataclass
-
-Each token is a simple immutable record:
-
-```python
-@dataclass
-class Token:
-    type: TokenType   # one of the TokenType enum values
-    value: str        # exact text from the source
-    line: int         # 1-based line number
-```
-
-The `@dataclass` decorator gives free `__eq__` comparison, which makes test assertions straightforward.
+`tokenize()` returns a `TokenList` — a growable array that doubles its capacity as needed — terminated by a final `EOF` token.
 
 ### Known Limitations
 
-- **Method assignment (`name=`)** is not tokenized as a single identifier. Recognizing it would require lookahead that conflicts with treating `=` as the assignment operator.
-- **String literals** are not parsed. A string like `"hello"` produces several `UNKNOWN` tokens (the quotes and each character). Ruby line comments starting with `#` are recognized and skipped.
-- **Unicode identifiers** are not supported. The character classes in the regex are ASCII-only.
+- **Method assignment (`name=`)** is not tokenized as a single identifier; the `=` is treated as a separate operator.
+- **String literals** are not parsed — their characters become `UNKNOWN` tokens. Ruby `#` line comments *are* recognized and skipped.
+- **Unicode identifiers** are not supported; the character classes are ASCII-only.
 
 ---
 
@@ -190,90 +173,87 @@ The `@dataclass` decorator gives free `__eq__` comparison, which makes test asse
 
 ```
 RubyLexer/
-└── ruby_lexer/
-    ├── lexer.py        # TokenType enum, Token dataclass, Lexer class
-    ├── main.py         # CLI entry point
-    └── test_lexer.py   # unittest suite (10 test cases)
+└── c_lexer/
+    ├── lexer.h
+    ├── lexer.c
+    ├── main.c
+    └── test.rb
 ```
 
-No third-party packages are required. The project uses only the Python standard library (`re`, `enum`, `dataclasses`, `argparse`, `unittest`).
+Pure C99, standard library only (`stdio.h`, `stdlib.h`, `string.h`, `ctype.h`).
 
 ---
 
-## How to Run
+## How to Build and Run
 
-**Requirements:** Python 3.7 or later.
+**Requirements:** any C99 compiler (`gcc`, `clang`, or MSVC `cl`).
 
-### Run the tests
-
-```bash
-cd ruby_lexer
-python -m unittest test_lexer.py -v
-```
-
-Expected output:
-
-```
-test_class_var_not_instance_var ... ok
-test_class_vars ... ok
-test_constants ... ok
-test_defined_keyword ... ok
-test_global_vars ... ok
-test_instance_vars ... ok
-test_keywords ... ok
-test_local_variables ... ok
-test_method_suffixes ... ok
-test_multiline_snippet ... ok
-
-Ran 10 tests in 0.001s
-
-OK
-```
-
-### Tokenize a Ruby file
+### Build the CLI
 
 ```bash
-python ruby_lexer/main.py path/to/file.rb
+cd c_lexer
+gcc -std=c99 -Wall -Wextra -o rubylex lexer.c main.c
 ```
 
-### Tokenize an inline string
+### Run it on the sample file
+
+The repository includes `test.rb`, a sample Ruby file that exercises every
+token type. Tokenize it with:
 
 ```bash
-python ruby_lexer/main.py -e "def greet(name)"
+./rubylex test.rb
+```
+
+You can also tokenize any other file, or an inline string:
+
+```bash
+./rubylex path/to/file.rb
+./rubylex -e "def greet(name)"
 ```
 
 ### Example
 
-Given this Ruby snippet:
+`test.rb` contains:
 
 ```ruby
-def greet(name)
-  @msg = @@prefix + $sep + name
-  puts msg if valid?
+# This is a comment
+class MyClass
+  def initialize(name)
+    @name = name
+    @@count += 1
+    $debug = false # This is a comment
+  end
 end
 ```
 
-Running `python ruby_lexer/main.py -e "..."` produces:
+Running `./rubylex test.rb` produces:
 
 ```
-LINE  TYPE          VALUE
-----------------------------------------
-1     KEYWORD       def
-1     IDENTIFIER    greet
-1     UNKNOWN       (
-1     IDENTIFIER    name
-1     UNKNOWN       )
-2     INSTANCE_VAR  @msg
-2     UNKNOWN       =
-2     CLASS_VAR     @@prefix
-2     UNKNOWN       +
-2     GLOBAL_VAR    $sep
-2     UNKNOWN       +
-2     IDENTIFIER    name
-3     IDENTIFIER    puts
-3     IDENTIFIER    msg
-3     KEYWORD       if
-3     IDENTIFIER    valid?
-4     KEYWORD       end
-4     EOF
+LINE  COL   TYPE          VALUE
+----------------------------------------------
+2     1     KEYWORD       class
+2     7     CONSTANT      MyClass
+3     3     KEYWORD       def
+3     7     IDENTIFIER    initialize
+3     17    UNKNOWN       (
+3     18    IDENTIFIER    name
+3     22    UNKNOWN       )
+4     5     INSTANCE_VAR  @name
+4     11    UNKNOWN       =
+4     13    IDENTIFIER    name
+5     5     CLASS_VAR     @@count
+5     13    UNKNOWN       +
+5     14    UNKNOWN       =
+5     16    UNKNOWN       1
+6     5     GLOBAL_VAR    $debug
+6     12    UNKNOWN       =
+6     14    KEYWORD       false
+7     3     KEYWORD       end
+8     1     KEYWORD       end
+8     4     EOF
 ```
+
+Every name gets a token — keyword, identifier, constant, instance/class/global
+variable — tagged with the line and column where it starts. The two comments
+produce no tokens. Operators and punctuation become `UNKNOWN`, so `+=` shows up
+as a `+` token followed by a `=` token.
